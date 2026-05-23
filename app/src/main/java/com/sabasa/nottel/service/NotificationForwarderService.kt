@@ -1,5 +1,9 @@
 package com.sabasa.nottel.service
 
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import kotlinx.coroutines.flow.collectLatest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -30,7 +34,6 @@ class NotificationForwarderService : NotificationListenerService() {
 
     // In-memory duplicate tracker: packageName → last "title|message"
     private val lastContentMap = mutableMapOf<String, String>()
-
     override fun onCreate() {
         super.onCreate()
         db = DatabaseRepository(this)
@@ -42,11 +45,27 @@ class NotificationForwarderService : NotificationListenerService() {
             settings = settings,
             onFlush = { items -> handleFlush(items) }
         )
+
+        // Register action receiver
+        val filter = IntentFilter().apply {
+            addAction(ServiceActions.ACTION_PAUSE)
+            addAction(ServiceActions.ACTION_RESUME)
+            addAction(ServiceActions.ACTION_STOP)
+        }
+        registerReceiver(actionReceiver, filter, RECEIVER_NOT_EXPORTED)
+
+        // Observe state changes — update the notification to reflect pause/resume
+        serviceScope.launch(Dispatchers.Main) {
+            ForwardingState.isActive.collectLatest { isActive ->
+                updateServiceNotification(isActive)
+            }
+        }
+
         startForegroundWithPlaceholder()
     }
 
     override fun onDestroy() {
-        // Drain any remaining queued items before the service dies
+        unregisterReceiver(actionReceiver)
         serviceScope.launch {
             batchQueue.flush()
         }
@@ -61,7 +80,13 @@ class NotificationForwarderService : NotificationListenerService() {
     override fun onListenerDisconnected() {
         // Listener was revoked by the OS or user — reflect in state
         ForwardingState.isActive.value = false
-        requestRebind(componentName)  // ask the OS to reconnect
+
+        requestRebind(
+            android.content.ComponentName(
+                this,
+                NotificationForwarderService::class.java
+            )
+        )
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
@@ -170,6 +195,37 @@ class NotificationForwarderService : NotificationListenerService() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
         startForeground(SERVICE_NOTIFICATION_ID, notification)
+    }
+
+    private fun updateServiceNotification(isActive: Boolean) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val text = if (isActive) "Forwarding to Telegram" else "Paused"
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Notification Forwarder")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
+        manager.notify(SERVICE_NOTIFICATION_ID, notification)
+    }
+
+    private val actionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                ServiceActions.ACTION_PAUSE -> {
+                    ForwardingState.isActive.value = false
+                }
+                ServiceActions.ACTION_RESUME -> {
+                    ForwardingState.isActive.value = true
+                }
+                ServiceActions.ACTION_STOP -> {
+                    ForwardingState.isActive.value = false
+                    serviceScope.launch { batchQueue.flush() }
+                    stopSelf()
+                }
+            }
+        }
     }
 
     companion object {
